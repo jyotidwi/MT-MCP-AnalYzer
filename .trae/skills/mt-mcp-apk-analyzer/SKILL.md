@@ -1,11 +1,11 @@
 ---
-name: "apk-analyzer"
-description: "Analyzes APK files using mt_mcp service and generates analysis reports. Invoke when user wants to analyze APK for payment features, sensitive strings, class structures, resources, or any APK analysis task."
+name: "mt-mcp-apk-analyzer"
+description: "MT管理器MCP服务专用APK分析技能。基于MT管理器的mt_mcp服务对APK文件进行深度分析（支付功能、敏感字符串、类结构、资源等），生成结构化分析报告。当用户需要分析APK时触发此技能。"
 ---
 
-# APK Analyzer
+# MT管理器MCP APK分析技能
 
-APK 分析技能，使用 mt_mcp 服务对 APK 文件进行深度分析并生成结构化报告。
+MT管理器MCP服务专用APK分析技能，使用 mt_mcp 服务对 APK 文件进行深度分析并生成结构化报告。
 
 ## 核心原则
 
