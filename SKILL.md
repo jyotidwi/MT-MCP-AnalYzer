@@ -5,954 +5,436 @@ description: "MT管理器MCP服务专用APK分析技能。基于MT管理器的mt
 
 # MT管理器MCP APK分析技能
 
-MT管理器MCP服务专用APK分析技能，使用 mt_mcp 服务对 APK 文件进行深度分析并生成结构化报告。
+基于 mt_mcp 服务分析 APK,支持只读分析和编辑重打包。**根据用户需求动态分析,不预设固定流程。**
 
-## 核心原则
+## 核心流程
 
-**本技能不预设固定分析内容，而是根据用户的具体分析需求动态执行分析。**
+**必须先 `mt_apk_open`** → 获取 `workspaceId` → 后续所有工具都需要此 ID。
 
-用户可以指定：
-- APK 文件（支持模糊名称匹配）
-- 分析关键词（单个或多个）
-- 搜索范围（dex_string、dex_class、dex_method、smali、axml、resource_table_* 等）
-- 分析深度（简单搜索、详细分析、完整报告）
-- 特定包名或类名过滤
-
-### 分析决策框架
-
-```
-用户意图
-├─ "这个APP做了什么"        → 架构概览路径（T1）
-├─ "找到XXX功能在哪"        → 功能定位路径（T2）
-├─ "有没有安全隐患"          → 安全审计路径（T4）
-├─ "网络请求都去了哪"        → 网络追踪路径（T3）
-├─ "这个方法谁调用的"        → 调用链追踪路径（T5）
-├─ "能不能改成XXX"          → 先定位 → 再出修改方案
-└─ 模糊意图                 → 先读 Manifest 建立全局认知，再追问细化
-```
-
-**关键判断：** 用户说"分析"时往往隐含了"然后修改"的意图。分析过程中应主动记录可修改点，为后续解决方案建议积累素材。
-
----
-
-# 第一部分：快速入门
-
-## 1.1 核心流程
-
-> **必须先调用 `open()`** → 获取 `workspaceId` → 后续所有调用都需要此 ID
+### 只读分析工具
 
 | 工具 | 用途 | 关键参数 |
 |------|------|----------|
-| `mt_apk_open` | 打开 APK，获取 workspaceId | path |
-| `mt_apk_list` | 浏览类/文件/资源 | view, prefix / className |
-| `mt_apk_search` | 搜索关键词/代码/字符串 | query, scopes, queryType |
-| `mt_apk_read` | 读取 Smali/XML/资源详情 | locator |
-| `mt_apk_continue` | 翻页 | nextCursor |
+| `mt_apk_open` | 打开 APK,获取 workspaceId | path, temporary |
+| `mt_apk_list_available_apks` | 列出可用 APK 文件 | prefix, limit |
+| `mt_apk_list` | 浏览 ZIP/DEX类/资源表 | workspaceId, editSessionId, view, prefix, limit |
+| `mt_apk_outline_class` | 查看类结构(字段+方法) | workspaceId, editSessionId, locator, limit |
+| `mt_apk_search` | 搜索关键词/代码/字符串 | workspaceId, editSessionId, target, query, queryType |
+| `mt_apk_read_text` | 读取 Smali/XML/文本 | workspaceId, editSessionId, locator, limit, maxChars |
+| `mt_apk_read_resource` | 批量读取资源值 | workspaceId, editSessionId, reads[], maxValueXmlChars |
+| `mt_apk_read_zip_bytes` | 读取 ZIP 原始字节(十六进制) | workspaceId, editSessionId, locator, byteOffset, maxBytes |
+| `mt_apk_xref_dex` | DEX 交叉引用(方法/字段/类调用者) | workspaceId, editSessionId, locator, methodResolution, limit |
+| `mt_apk_xref_resource` | 资源引用查询 | workspaceId, editSessionId, locator, scopes, limit |
+| `mt_apk_continue` | 翻页 | workspaceId, editSessionId, nextCursor, limit |
 
-## 1.2 搜索范围选择器
+### 编辑流程工具
 
-| 查找目标 | Scope | 示例 query |
-|----------|-------|------------|
-| 按名称查类 | `dex_class` | `"VipStatus"` |
-| 按名称查方法 | `dex_method` | `"isVip"` |
-| 按名称查字段 | `dex_field` | `"vipStatus"` |
-| 硬编码文本/URL/密钥 | `dex_string` | `"https://api."` |
-| Smali 指令模式 | `smali` | `"sget-object.*VipStatus"` (regex) |
-| XML 清单/布局文本 | `axml` | `"android.permission"` |
-| 按名称查资源 | `resource_table_name` | `"app_name"` |
-| 按值查资源 | `resource_table_value` | `"error message"` |
-| 按路径查文件 | `zip_entries` | `"lib/armeabi"` |
-| 未知/广泛探索 | `["dex_string","smali"]` | `"keyword"` |
-
-## 1.3 常见陷阱
-
-**#1 scopes 格式：**
-
-```
-OK:   scopes="dex_string"                    (单 scope 字符串)
-OK:   scopes=["dex_string","smali"]          (多 scope 数组)
-BAD:  scopes="dex_string,smali"              (逗号字符串 → 错误)
-BAD:  scopes='["dex_string"]'                (引号包裹 JSON → 错误)
-```
-
-**#2 Dalvik 类名格式：**
-
-```
-Java:   com.example.MyClass         →  Dalvik: Lcom/example/MyClass;
-Java:   com.example.MyClass$Inner   →  Dalvik: Lcom/example/MyClass$Inner;
-规则:   L 前缀 + / 替换 . + ; 后缀
-```
-
-**#3 list 与 read 的 kind 映射：**
-
-```
-list: view="dex_class_outline"  →  read: kind="dex_class"     (不是 dex_class_outline!)
-list: dex_classes 条目 locator  →  read: kind="dex_class"
-outline methods[].locator       →  read: kind="dex_method"
-outline fields[].locator        →  read: kind="dex_field"
-```
-
-**#4 搜索结果"看起来没有"但实际有：** dex_string 搜不到时，换用 `smali` scope 搜索 `const-string` 指令，或用 `axml` scope 搜索 Manifest 中的 meta-data。
-
-**#5 混淆类方法太多找不到目标：** 先看 `methods[].interestingStrings`，找到包含目标字符串的方法，再定向读取。
-
-**#6 分页游标过期：** 两次 continue 间隔太久游标可能失效，重新执行原始查询即可。
-
-**#7 read 静默截断：** 返回内容末尾不是完整的 `.method` / `.end method` 结构时，说明被截断，需增大 `maxChars` 或用 `startLine` 分段读取。
+| 工具 | 用途 | 关键参数 |
+|------|------|----------|
+| `mt_apk_edit_open` | 创建编辑会话 → editSessionId | workspaceId |
+| `mt_apk_edit_text` | 编辑 Smali/AXML/ZIP文本 | workspaceId, editSessionId, locator, targetVersion, edits[] |
+| `mt_apk_edit_resource` | 编辑资源值 | workspaceId, editSessionId, edits[] |
+| `mt_apk_edit_check` | 检查编辑/构建可行性 | workspaceId, editSessionId, runBuildChecks |
+| `mt_apk_build` | 构建并签名 APK | workspaceId, editSessionId, outputName, overwrite |
+| `mt_apk_close` | 关闭临时工作区(temporary=true) | workspaceId |
 
 ---
 
-# 第二部分：工具规范
+## 关键规则
 
-## 2.1 mt_apk_open
+### Locator 格式(字符串,非 JSON)
 
-打开 APK 工作区。**必须第一个调用。** 返回 `workspaceId`，后续所有工具都需要此 ID。
+```
+dex_class:Lcom/example/Foo;
+dex_method:Lcom/example/Foo;->bar()V
+dex_field:Lcom/example/Foo;->flag:Z
+zip_entry:assets/config.json
+axml:AndroidManifest.xml
+resource:0x7f010000
+```
 
-**参数：**
+Dalvik 类名格式:`L` 前缀 + `/` 替换 `.` + `;` 后缀(如 `Lcom/example/MyClass;`)。
 
-| 参数 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| path | 是 | - | 相对 APK 路径或 `"mt://current-apk"` |
-| reuseWorkspaceByPath | 否 | true | 对相同 APK 复用已有工作区 |
-| workspaceId | 否 | - | 通过 ID 重新打开指定工作区 |
+### editSessionId 规则
 
-路径规则：仅支持相对路径，不支持绝对路径、`\` 反斜杠、`.`/`..` 路径段。
+- 读取基础工作区:传 `""`(空字符串)
+- 读取/编辑编辑会话:传 `mt_apk_edit_open` 返回的 ID
+- 所有 list/search/read/xref/continue 工具都需要此参数
 
-**返回字段：**
+### 通用必填参数
 
-| 字段 | 说明 |
-|------|------|
-| `workspaceId` | **保存此值** — 后续所有调用必需 |
-| `compact.manifest.package` | 应用包名 |
-| `compact.manifest.versionName` | 版本字符串 |
-| `compact.manifest.versionCode` | 版本号 |
-| `compact.count.dexClasses` | 总类数（帮助决定搜索策略） |
-| `compact.count.zipEntries` | 总文件数 |
-| `compact.count.resourceTableEntries` | 总资源数 |
-| `compact.capability.hasDex` | 是否有 DEX 数据 |
-| `compact.capability.hasResources` | 是否有资源表 |
-| `compact.capability.hasAssets` | 是否有 assets |
+所有工具的参数均为必填(无可选参数)。常用默认值:
+- `limit=50`(搜索/xref) / `200`(list/outline) / `500`(read_text)
+- `maxChars=49152` / `maxBytes=256`
+- `prefix=""` 表示无过滤
 
-## 2.2 mt_apk_list
+---
 
-按视图类型浏览 APK 结构。返回数据数组 + 分页信息。
+## 搜索 target 选择器
 
-**参数：**
+`mt_apk_search` 用 `target`(单值枚举)选择搜索范围:
 
-| 参数 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| workspaceId | 是 | - | 来自 open 结果 |
-| view | 是 | - | 见下方视图表 |
-| prefix | 否 | - | 按前缀过滤（格式因视图而异） |
-| className | 否 | - | **仅 view=dex_class_outline**，必须是 Dalvik 描述符 |
-| limit | 否 | 200 | 页大小，最大 1000 |
+| target | 搜索内容 | 最佳用途 |
+|--------|----------|----------|
+| `overview` | ZIP路径+AXML+资源ID/名称/值+DEX名称+DEX字符串 | 未知目标的广搜(不含smali) |
+| `files` | ZIP路径+解码AXML文本 | 搜索清单/布局/文件路径 |
+| `resource_table_names` | 资源ID/名称 | 按名称查找资源 |
+| `resource_table_values` | 解码资源值 | 查找字符串资源值 |
+| `resource_table_file_paths` | 指向ZIP路径的资源值 | 查找引用文件路径的资源 |
+| `dex_names` | 类/字段/方法名称 | 按名称查DEX实体 |
+| `dex_strings` | DEX字符串字面量(按类分组) | 硬编码文本、URL、密钥 |
+| `dex_string_members` | DEX字符串字面量(按成员分组) | 字符串使用详情 |
+| `smali` | 完整Smali反汇编文本 | 指令模式、字段访问、调用 |
 
-**视图类型：**
+**prefix 参数(因 target 而异):** `overview` 必须为 `""`;`files` 用 ZIP路径前缀;`resource_table_*` 用 `0x7f..`/`type/name`/`name`;`dex_*`/`smali` 用类所有者前缀(Java包名/斜杠/L前缀)。
 
-| view | 用途 | 关键参数 | 返回 |
-|------|------|----------|------|
-| `zip_entries` | 列出 APK 中的文件 | prefix="res/layout/" | zip_entry 定位器 |
-| `dex_classes` | 列出 DEX 类 | prefix="com/example" | dex_class 定位器 + fieldCount / methodCount / classSmaliStartLine |
-| `dex_class_outline` | 类字段 + 方法 | className="Lcom/ex/Cls;" (Dalvik!) | header + fields[] + methods[] 含定位器 |
-| `resource_table_entries` | 资源表条目 | prefix="string/" 或 "0x7f01" | resource_table_entry 定位器 |
+---
 
-**outline 返回字段（最常用视图）：**
+## 工具参数详解
 
-| 字段 | 说明 |
-|------|------|
-| `header.className` | 完整 Dalvik 类名 |
-| `header.super` | 父类（用于继承分析） |
-| `header.implements` | 实现的接口（数组） |
-| `header.source` | 源文件名（.kt = Kotlin, .java = Java） |
-| `header.access` | public / private / abstract 等 |
-| `fields[].name` / `fields[].sig` / `fields[].access` | 字段名 / 签名 / 修饰符 |
-| `fields[].locator` | 传给 read → kind="dex_field" |
-| `methods[].name` / `methods[].sig` / `methods[].access` | 方法名 / 签名 / 修饰符 |
-| `methods[].interestingStrings` | 此方法使用的字符串常量 |
-| `methods[].interestingInvokes` | 此方法调用的其他方法 |
-| `methods[].locator` | 传给 read → kind="dex_method" |
-| `classSmaliStartLine` | 可用作 read startLine 进行定向读取 |
-
-## 2.3 mt_apk_read
-
-通过 list 或 search 获取的 locator 读取详细内容。
-
-**参数：**
-
-| 参数 | 默认值 | 最大值 | 适用范围 |
-|------|--------|--------|----------|
-| workspaceId | - | - | 所有 |
-| locator | - | - | 所有（来自 list/search 结果） |
-| startLine | 1 | - | dex_class, zip_entry, axml |
-| startColumn | 1 | - | dex_class, zip_entry, axml |
-| limit | 500 | 2000 | 文本定位器（hex 格式时不可用） |
-| maxChars | 49152 | 131072 | 文本定位器（resource_table_entry 时不可用） |
-| includeLineNumbers | false | - | 文本定位器 |
-| format | "text" | - | 仅 zip_entry："text" 或 "hex" |
-| maxBytes | 256 | 4096 | 仅 hex 格式 |
-| hexOffset | 0 | - | 仅 hex 格式 |
-| perValueTextMaxChars | 4096 | 131072 (limit=1时) | 仅 resource_table_entry |
-| valueOffset | 0 | - | 仅 resource_table_entry |
-
-**Locator 种类：**
-
-| kind | 必填字段 | 输出 | 示例 |
-|------|----------|------|------|
-| `dex_class` | className | 完整 Smali 源码 | `{"className":"Lcom/ex/Cls;","kind":"dex_class"}` |
-| `dex_method` | className + methodSig | 方法 Smali | `{"className":"Lcom/ex/Cls;","methodSig":"onCreate()V","kind":"dex_method"}` |
-| `dex_field` | className + fieldSig | 字段定义 | `{"className":"Lcom/ex/Cls;","fieldSig":"name:Ljava/lang/String;","kind":"dex_field"}` |
-| `zip_entry` | path | 原始文件内容 | `{"path":"assets/config.json","kind":"zip_entry"}` |
-| `axml` | path | 解码后的 Android XML | `{"path":"AndroidManifest.xml","kind":"axml"}` |
-| `resource_table_entry` | resourceTableId | 资源值 | `{"resourceTableId":"0x7f040001","kind":"resource_table_entry"}` |
-
-**读取大型类的策略：**
-
-| 策略 | 适用场景 | 示例 |
-|------|----------|------|
-| 行范围 | 知道大概行号 | `read(locator, startLine=100, limit=50)` |
-| 最大字符 | 需要完整类但默认太小 | `read(locator, maxChars=131072)` |
-| 先 outline | 只需特定方法 | `list(outline) → 找到方法 → read(locator, startLine=methodLine, limit=30)` |
-
-## 2.4 mt_apk_search
-
-最强大的工具。搜索所有 APK 内容。
-
-**必填参数：**
+### mt_apk_open
 
 | 参数 | 说明 |
 |------|------|
-| workspaceId | 来自 open 结果 |
-| query | 搜索关键词或正则表达式 |
-| queryType | `"literal"` (文本匹配) 或 `"regex"` (正则表达式) |
-| caseSensitive | 布尔值 — 是否区分大小写 |
-| scopes | 搜索范围 — 见下方 scope 表 |
+| path | `"mt://current-apk"` / `"mt://workspace/<id>"`(重开) / `list_available_apks` 返回的相对路径 |
+| temporary | `true`=一次性(可close删除);`false`=可复用/重开/长期保留 |
 
-**可选参数：**
+返回 `workspaceId`、`apkFileName`、`compact.manifest.package/versionName/versionCode`、`compact.count.*`、`compact.capability.*`。
 
-| 参数 | 默认值 | 最大值 | 说明 |
-|------|--------|--------|------|
-| limit | 50 | 200 | 每页最大命中数 |
-| matchMode | "contains" | - | "contains" (子串) 或 "exact" (全匹配)。**scopes 包含 smali 时 exact 无效** |
-| includeSnippet | true | - | 返回预览片段 |
-| includeMatchOffsets | false | - | 返回 matchStart, matchEnd, matchedText |
-| snippetMaxChars | 240 | 1000 | 每条命中的最大片段长度 |
-| classPrefix | - | - | 按类所有者前缀过滤（Java、斜杠或 L 前缀格式） |
-| zipEntryPrefix | - | - | 按 ZIP 条目路径前缀过滤（区分大小写） |
-| resourceTableTypes | - | - | 按资源类型过滤（如 "string", "layout"） |
-| dexStringGranularity | "class" | - | 仅 dex_string："class" 返回匹配类，"member" 返回匹配字段/方法 |
+### mt_apk_list
 
-**所有 Scope：**
+| view | prefix 格式 | 返回 |
+|------|----------|------|
+| `zip_entries` | `"res/layout/"` | zip_entry 定位器 |
+| `dex_classes` | `"Lcom/example/"` 或 `"com.example"` | dex_class 定位器(传给 outline_class) |
+| `resource_table` | `"0x7f010000"` / `"string/"` / `"app_name"` | resource 定位器 + 轻量值预览 |
 
-| Scope | 搜索内容 | 返回 locator kind | 最佳用途 |
-|-------|----------|-------------------|----------|
-| `zip_entries` | ZIP 文件路径 | zip_entry | 按路径查找文件 |
-| `axml` | 解码后的 XML 文本 | axml | 搜索清单/布局 |
-| `resource_table_id` | 资源 ID (0x...) | resource_table_entry | 按 ID 查找资源 |
-| `resource_table_name` | 资源名称 | resource_table_entry | 按名称查找资源 |
-| `resource_table_value` | 资源值 | resource_table_entry | 查找字符串资源 |
-| `dex_class` | 类名/描述符 | dex_class | 查找类定义 |
-| `dex_field` | 字段名（不含签名） | dex_field | 查找成员变量 |
-| `dex_method` | 方法名（不含签名） | dex_method | 查找函数定义 |
-| `dex_string` | 字符串字面量（不含类/方法/字段名） | dex_class 或 dex_field/dex_method | 硬编码文本、URL、密钥 |
-| `smali` | 完整 Smali 反汇编文本 | dex_class | 指令模式、字段访问、调用 |
+### mt_apk_outline_class
 
-**搜索返回：** 每条命中包含 `{locator, matchKind, snippet, matchedText, matchTarget, matchStart, matchEnd}`。搜索结果中的 `locator` 可直接传给 `mt_apk_read`。
+传入 `dex_class:Lcom/example/Foo;` 定位器,返回 `header`(className/super/implements/source/access) + `fields[]`(name/sig/access/locator) + `methods[]`(name/sig/access/interestingStrings/locator)。
 
-## 2.5 mt_apk_continue
+### mt_apk_read_text
 
-继续 list、read 或 search 的分页结果。
+| locator 前缀 | 读取内容 | 可编辑 |
+|------------|---------|-------|
+| `zip_entry:` | ZIP文件文本 | ✓(非 resources.arsc) |
+| `axml:` | 解码后的 Android XML | ✓ |
+| `dex_class:` | 完整类 Smali 源码 | ✓ |
+| `dex_method:` | 单方法 Smali | ✓ |
+| `dex_field:` | 字段定义 Smali | ✗(只读) |
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| workspaceId | 是 | |
-| nextCursor | 是 | 来自 `pagination.nextCursor` |
-| limit | 否 | 覆盖页大小（先检查 `pagination.limitMax`） |
+参数:`limit`(行数,max 2000)、`maxChars`(max 131072)、`startLine`/`startColumn`(0-based)。返回 `textWindow.text` + `targetVersion`(**编辑时必需**)。
 
-当任何调用返回 `pagination.hasMore: true` 时使用。**完全照搬**返回的 `workspaceId` 和 `nextCursor`，不要解析、构造、拼接或修改游标。
+### mt_apk_read_resource
 
-## 2.6 通用返回结构
+批量读取(1-200个),每个 read 含 `locator`(如 `resource:0x7f010000`) + `variant`(如 `default`)。
+预算参数:`maxValueChars=4096` / `maxValueXmlChars=32768` / `maxItemsPerValue=50` / `resolveDepth=0`。
+返回 `results[].value`(摘要) + `results[].valueXml`(完整可编辑XML) + `results[].targetVersion`。
 
-```json
-{
-  "ok": true/false,
-  "data": { ... },
-  "error": { "code": "...", "message": "...", "severity": "...", "recoverable": true/false },
-  "nextActions": [ { "tool": "mt_apk_continue", "purpose": "continue", "arguments": { ... } } ]
-}
-```
+### mt_apk_xref_dex
 
-**分页元数据：**
+查找方法/字段/类的调用者。`methodResolution` 模式:
+- `dispatch`(推荐,用于 dex_method):查找可能到达目标的调用
+- `exact`:精确匹配 MethodReference
+- `slot`:查找可见重写族
+- `not_applicable`(用于 dex_field/dex_class):字段/类只支持精确引用
 
-| 字段 | 说明 |
-|------|------|
-| `pagination.hasMore` | 是否有更多页 |
-| `pagination.nextCursor` | 不透明游标，用于继续翻页 |
-| `pagination.returnedCount` | 当前页返回数量 |
-| `pagination.limitMax` | 继续翻页的最大 limit |
-| `pagination.totalAvailableCount` | 已知的总数 |
+### mt_apk_edit_text
 
-始终检查 `nextActions` 数组中的继续/重试操作。
+**必须先 `read_text` 获取 `targetVersion`。** `edits[]` 每项含 `mode`/`matchText`/`writeText`:
 
-## 2.7 错误速查
+| mode | 说明 | matchText | writeText |
+|------|------|-----------|-----------|
+| `write_target` | 替换整个目标/创建新目标(`targetVersion="missing"`) | "" | 完整内容 |
+| `delete_target` | 删除整个目标 | "" | "" |
+| `replace_match` | 替换匹配文本(空writeText=删除) | 原文本 | 新文本 |
+| `insert_before_match` | 在匹配前插入 | 匹配文本 | 插入文本 |
+| `insert_after_match` | 在匹配后插入 | 匹配文本 | 插入文本 |
 
-| 错误 | 原因 | 修复 |
-|------|------|------|
-| Invalid scope | scopes 格式错误 | 单个：`scopes="x"` / 多个：`scopes=["x","y"]` / 绝不要逗号字符串或引号包裹 JSON |
-| Class not found | className 非 Dalvik 格式 | 使用 `Lcom/example/Cls;` 而非 `com.example.Cls` |
-| Unsupported locator | read 中 kind 错误 | 使用 `dex_class` 而非 `dex_class_outline`；确保所有必填字段存在 |
-| Missing query | 使用 classPrefix 时无 query | `query` 始终必填 |
-| Data truncated | 输出过大 | 增加 maxChars（最大 131072）/ 使用 startLine+limit / 使用 continue |
-| Path rejected | 路径格式错误 | 仅相对路径，正斜杠，无 `.`/`..` |
-| exact + smali 冲突 | matchMode=exact 且 scopes 含 smali | scopes 包含 "smali" 时使用 matchMode="contains"（默认值） |
+`matchText` 必须在目标中**恰好出现一次**;多次匹配返回 `TEXT_MATCH_AMBIGUOUS`,需用更长上下文重试。单个 locator 的多个编辑是原子操作。
 
-错误码：4401 = 参数校验错误，400 = 业务逻辑错误。检查 `recoverable` 和 `retrySameArguments` 标志，部分错误包含 `argument`、`badValue`、`allowedValues`、`example` 等辅助字段。
+### mt_apk_edit_resource
+
+**必须先 `read_resource` 获取 `locator`/`variant`/`targetVersion`/`valueXml`。** 每次 1-200 项(推荐约20)。不能修改根元素名称/资源ID/变体,不能创建新资源。
+
+### mt_apk_build
+
+`outputName=""` 用默认名 `<原文件名>_mcp_<editSessionId>_sign.apk`(始终覆盖);非空时若文件存在且 `overwrite=false` 返回 `OUTPUT_ALREADY_EXISTS`。输出到 MCP 配置目录,源 APK 不变。
 
 ---
 
-# 第三部分：APK 匹配与场景
+## 搜索模式速查
 
-## 3.1 APK 智能匹配
-
-**支持模糊名称匹配，无需精确输入完整文件名。**
-
-**匹配优先级：** 精确匹配 > 包名匹配 > 应用名匹配 > 模糊匹配（子串）
-
-| 用户输入 | 匹配方式 | 说明 |
-|---------|---------|------|
-| `mt://current-apk` | 当前APK | 直接使用当前打开的 APK |
-| `微信` | 模糊匹配 | 匹配包含"微信"的 APK 文件名或包名 |
-| `com.tencent.mm` | 包名匹配 | 匹配包名包含该字符串的 APK |
-| `a.apk` | 精确匹配 | 直接使用指定文件 |
-| `kwyy` | 模糊匹配 | 匹配文件名或包名包含该字符串的 APK |
-
-**常见应用名称映射：**
-
-| 用户可能输入 | 可能匹配的 APK/包名 |
-|-------------|-------------------|
-| 微信 | wechat, com.tencent.mm |
-| 支付宝 | alipay, com.eg.android.AlipayGphone |
-| 淘宝 | taobao, com.taobao.taobao |
-| 抖音 | douyin, com.ss.android.ugc.aweme |
-| 快手 | kuaishou, com.smile.gifmaker |
-| QQ | qq, com.tencent.mobileqq |
-| 百度 | baidu, com.baidu.searchbox |
-| 京东 | jd, com.jingdong.app.mall |
-
-**智能选择流程：**
-
-1. 调用 `mt_apk_open` 尝试打开
-2. 如果返回 `CURRENT_APK_NOT_AVAILABLE`，从 `availableApkFiles` 列表中模糊匹配用户输入
-3. 匹配到多个 APK 时，列出结果让用户选择
-4. 打开匹配的 APK
-
-## 3.2 分析场景速查
-
-**功能分析：**
-
-| 场景 | 推荐关键词 | 推荐范围 |
-|------|-----------|---------|
-| 支付功能 | payment, pay, purchase, order, checkout | dex_string, dex_class |
-| 会员/VIP | vip, premium, member, subscribe, subscription | dex_string, dex_class |
-| 登录认证 | login, auth, token, session, credential | dex_string, smali |
-| 社交分享 | share, social, wechat, weibo, facebook | dex_string |
-| 推送通知 | push, notification, fcm, jpush, xiaomi | dex_string |
-| 广告SDK | ad, ads, banner, interstitial, reward | dex_string, dex_class |
-| 地图定位 | map, location, gps, baidu, amap | dex_string |
-| 网络请求 | http, request, api, retrofit, okhttp | dex_string, smali |
-| 数据存储 | database, sqlite, room, sharedpreferences | dex_string, dex_class |
-| 文件操作 | file, download, upload, storage | dex_string, smali |
-
-**安全分析：**
-
-| 场景 | 推荐关键词 | 推荐范围 |
-|------|-----------|---------|
-| 敏感字符串 | password, secret, key, token, api_key | dex_string |
-| 加密相关 | encrypt, decrypt, cipher, aes, rsa, md5 | dex_string, smali |
-| 硬编码数据 | http://, https://, api., .com, .net | dex_string |
-| 权限分析 | permission, uses-permission | axml |
-| WebView | webview, javascript, loadurl | dex_string, smali |
-| 组件暴露 | exported=true, intent-filter | axml |
-
-**结构分析：**
-
-| 场景 | 分析方法 | 说明 |
-|------|---------|------|
-| 入口分析 | 分析 AndroidManifest | Activity、Service、Receiver |
-| 类继承 | dex_class_outline | 查看父类和接口 |
-| 方法调用 | smali 搜索 | 查找 invoke 指令 |
-| 资源引用 | resource_table_* | 查找资源使用 |
-| 第三方库 | dex_classes + prefix | 分析第三方包结构 |
-
-## 3.3 搜索模式速查
-
-| 目标 | scopes | queryType | query |
+| 目标 | target | queryType | query 示例 |
 |------|--------|-----------|-------|
-| API URL | `dex_string` | regex | `https?://[a-zA-Z0-9._/-]+` |
-| 点击事件处理 | `dex_method` | literal | `onClick` |
-| 枚举类 | `dex_class` | regex | `.*Status$\|.*Type$\|.*Mode$` |
+| API URL | `dex_strings` | regex | `https?://[a-zA-Z0-9._/-]+` |
+| 按名称查类/方法/字段 | `dex_names` | literal | `onClick` |
+| 枚举类 | `dex_names` | regex | `.*Status$\|.*Type$` |
 | 静态字段读取 | `smali` | regex | `sget-object.*->FIELD:Lcom/target/.*;` |
-| 实例字段读取 | `smali` | regex | `iget-object.*->FIELD:Lcom/target/.*;` |
-| 字段写入操作 | `smali` | regex | `sput-object\|iput-object.*->FIELD:` |
-| 接口方法调用 | `smali` | regex | `invoke-interface.*->methodName` |
-| 虚方法调用 | `smali` | regex | `invoke-virtual.*->methodName` |
-| 静态方法调用 | `smali` | regex | `invoke-static.*->ClassName;->methodName` |
-| 构造函数调用 | `smali` | regex | `invoke-direct.*-><init>` |
-| 空值检查分支 | `smali` | regex | `if-eqz.*:cond_\|if-nez.*:cond_` |
-| 字符串常量使用 | `smali` | regex | `const-string.*"target text"` |
-| 字符串资源 | `resource_table_value` | literal | `error_message` + resourceTableTypes="string" |
-| 字符串使用详情 | `dex_string` | literal | `api_key` + dexStringGranularity="member" |
-| 包范围搜索 | 任意 | 任意 | 任意 + classPrefix="com/example/pkg" |
+| 字段写入 | `smali` | regex | `sput-object\|iput-object.*->FIELD:` |
+| 方法调用 | `smali` | regex | `invoke-virtual.*->methodName` |
+| 构造函数 | `smali` | regex | `invoke-direct.*-><init>` |
+| 字符串常量 | `smali` | regex | `const-string.*"target text"` |
+| 字符串资源 | `resource_table_values` | literal | `error_message` |
+| 权限/Manifest | `files` | literal | `android.permission` |
+| 包范围搜索 | 任意 | 任意 | 任意 + prefix="com/example/pkg" |
+| 广搜(未知目标) | `overview` | literal | `keyword` |
 
-> **注意：** `query` 始终必填，即使使用了 `classPrefix`。
-
-## 3.4 进阶搜索策略
-
-单次搜索只能定位到"某个类包含这个字符串"，真正有价值的分析需要多次搜索串联。
-
-**锚点扩散法** — 从已知字符串出发，逐步扩大范围：
-
-```
-1. search(scopes="dex_string", query="已知字符串")  → 找到锚点类
-2. list(view="dex_class_outline", className=<锚点类>)  → 了解结构
-3. search(scopes="smali", query="锚点类Dalvik名", queryType="regex")  → 扩散到引用者
-4. 对扩散结果重复步骤 2-3
-```
-
-**字段追踪法** — 理解状态变量的完整生命周期：
-
-```
-1. search(scopes="dex_field", query="isVip")  → 找到所有同名字段
-2. search(scopes="smali", query="iget.*isVip|sget.*isVip")  → 读取点
-3. search(scopes="smali", query="iput.*isVip|sput.*isVip")  → 写入点
-4. 读取写入点所在方法，理解赋值逻辑
-```
-
-**接口实现追踪法** — 找到接口的所有实现类：
-
-```
-1. search(scopes="dex_class", query="IPaymentCallback")  → 找到接口
-2. list(view="dex_class_outline", className=<接口类>)  → 确认是接口
-3. search(scopes="smali", query="invoke-interface.*IPaymentCallback", queryType="regex")  → 找调用点
-```
-
-**资源反向定位法** — 从 UI 资源反推代码逻辑：
-
-```
-1. search(scopes="resource_table_name", query="btn_vip_purchase")  → 找到资源 ID
-2. search(scopes="smali", query="0x7f......")  → 用资源 ID 找引用类
-3. list(view="dex_class_outline", className=<引用类>)  → 找事件处理方法
-```
+> `query` 始终必填。`overview` 模式下 `prefix` 必须为 `""`。`target="smali"` 时 `matchMode` 不能用 `exact`。
 
 ---
 
-# 第四部分：工作流模板
+## 工作流模板
 
 ### T1: APK 架构概览
 
 ```
-1. open(path="mt://current-apk")
-   → workspaceId + manifest 信息（包名、版本、类数量）
-
-2. read(locator={"path":"AndroidManifest.xml","kind":"axml"})
-   → activities, services, receivers, permissions, application 类
-
-3. list(view="dex_class_outline", className=<AppClass>)
-   → 初始化流程、注入的服务
-
-4. search(query="http|https|wss", scopes="dex_string", limit=20)
-   → API 域名、服务器地址
-
-5. search(query="Retrofit|OkHttp|Glide|Room|WorkManager", scopes="dex_string", limit=10)
-   → 使用的第三方框架
-
-6. list(view="dex_classes", prefix=<mainPkg>, limit=1)
-   → 主包中的类数量（检查 totalAvailableCount）
+1. open(path="mt://current-apk", temporary=false) → workspaceId + manifest
+2. read_text(locator="axml:AndroidManifest.xml", editSessionId="", ...) → 组件/权限
+3. outline_class(locator="dex_class:<AppClass>", editSessionId="", ...) → 初始化流程
+4. search(target="dex_strings", query="http|https|wss", queryType="regex", prefix="", ...) → API域名
+5. search(target="dex_strings", query="Retrofit|OkHttp|Glide", prefix="", ...) → 第三方框架
+6. list(view="dex_classes", prefix=<mainPkg>, editSessionId="", limit=1) → 主包类数量
 ```
 
 ### T2: 定位特定功能/字段
 
 ```
-1. search(query="keyword", scopes=["dex_string","smali"], limit=20)
-   → 找到所有引用关键词的类
-
-2. list(view="dex_class_outline", className=<hitClass>)
-   → 理解类的角色、字段、方法
-
-3. read(locator=hit.locator, maxChars=50000)
-   → 读取完整 Smali 实现
-
-4. search(query="fieldName", scopes="dex_field", classPrefix="relevant/pkg")
-   → 在包范围内查找同名字段
-
-5. search(query="sget.*fieldName|iget.*fieldName", scopes="smali", queryType="regex")
-   → 追踪所有访问此字段的代码位置
+1. search(target="overview", query="keyword", prefix="", limit=20, ...) → 找引用关键词的类
+2. outline_class(locator="dex_class:<hitClass>", editSessionId="", ...) → 理解类结构
+3. read_text(locator=<hit.locator>, editSessionId="", maxChars=50000, ...) → 读完整Smali
+4. search(target="dex_names", query="fieldName", prefix="relevant/pkg", ...) → 包范围内查同名字段
+5. search(target="smali", query="sget.*fieldName|iget.*fieldName", queryType="regex", prefix="", ...) → 追踪字段访问
 ```
 
 ### T3: 网络配置分析
 
 ```
-1. search(query="DomainConstants|BaseUrl|ApiHost|ServerConfig", scopes="dex_class")
-   → 找到网络配置类
-
-2. read(locator={"className":<configClass>,"kind":"dex_class"})
-   → 提取域名定义、环境配置
-
-3. search(query="https?://[a-zA-Z0-9._-]+", scopes="dex_string", queryType="regex", limit=30)
-   → 提取应用中所有 URL
-
-4. search(query="network_security_config", scopes="zip_entries")
-   → 找到网络安全配置文件
-
-5. read(locator={"path":"res/xml/network_security_config.xml","kind":"axml"})
-   → 读取安全策略（明文传输、证书固定）
+1. search(target="dex_names", query="BaseUrl|ApiHost|ServerConfig", queryType="regex", prefix="", ...) → 找配置类
+2. read_text(locator="dex_class:<configClass>", editSessionId="", ...) → 提取域名
+3. search(target="dex_strings", query="https?://[a-zA-Z0-9._-]+", queryType="regex", prefix="", limit=30, ...) → 提取URL
+4. search(target="files", query="network_security_config", prefix="", ...) → 找安全配置文件
+5. read_text(locator="axml:res/xml/network_security_config.xml", editSessionId="", ...) → 读安全策略
 ```
 
 ### T4: 安全分析
 
 ```
-1. read(locator={"path":"AndroidManifest.xml","kind":"axml"})
-   → 所有声明的权限、保护级别
-
-2. search(query="CAMERA|RECORD_AUDIO|READ_PHONE|ACCESS_FINE_LOCATION", scopes="axml")
-   → 敏感权限使用
-
-3. search(query="encrypt|decrypt|cipher|AES|RSA|ssl|tls", scopes="dex_string")
-   → 加密操作
-
-4. search(query="KeyStore|KeyGenerator|Cipher|Signature", scopes="dex_class")
-   → 安全相关类
-
-5. search(query="WebView|loadUrl|javascript", scopes="dex_string")
-   → WebView 使用（潜在 XSS 向量）
+1. read_text(locator="axml:AndroidManifest.xml", editSessionId="", ...) → 权限声明
+2. search(target="files", query="CAMERA|RECORD_AUDIO|ACCESS_FINE_LOCATION", queryType="regex", prefix="", ...) → 敏感权限
+3. search(target="dex_strings", query="encrypt|decrypt|cipher|AES|RSA", prefix="", ...) → 加密操作
+4. search(target="dex_names", query="KeyStore|Cipher|Signature", prefix="", ...) → 安全相关类
+5. search(target="dex_strings", query="WebView|loadUrl|javascript", prefix="", ...) → WebView使用
 ```
 
 ### T5: 追踪方法调用链
 
 ```
-1. list(view="dex_class_outline", className=<targetClass>)
-   → 找到感兴趣的方法签名
+1. outline_class(locator="dex_class:<targetClass>", editSessionId="", ...) → 找方法签名
+2. xref_dex(locator="dex_method:<targetClass>-><methodSig>", methodResolution="dispatch", editSessionId="", ...) → 找调用者(推荐dispatch)
+3. read_text(locator=<caller.sourceLocator>, editSessionId="", ...) → 读调用上下文
+4. search(target="smali", query="invoke.*targetClass;->methodName", queryType="regex", prefix="", ...) → 追踪invoke模式
+```
 
-2. search(query="methodName", scopes="smali", limit=30)
-   → 找到所有调用此方法的 Smali 位置
+### T6: 编辑修改 APK
 
-3. read(locator=caller.locator, startLine=matchStart, limit=30)
-   → 读取调用周围的上下文
-
-4. search(query="invoke.*targetClass;->methodName", scopes="smali", queryType="regex")
-   → 追踪特定的 invoke 模式
+```
+1. open(path=..., temporary=true) → workspaceId
+2. edit_open(workspaceId) → editSessionId
+3. read_text(locator="dex_method:...", editSessionId=<editSessionId>, ...) → 获取 targetVersion
+4. edit_text(locator=..., targetVersion=..., edits=[{mode:"replace_match", matchText:"const/4 v0, 0x0", writeText:"const/4 v0, 0x1"}], ...) → 修改
+5. edit_check(workspaceId, editSessionId, runBuildChecks=true) → 验证构建
+6. build(workspaceId, editSessionId, outputName="", overwrite=false) → 构建签名APK
+7. close(workspaceId) → 释放临时工作区(可选)
 ```
 
 ---
 
-# 第五部分：高级技巧
+## 分析场景速查
 
-## 5.1 混淆与反混淆
+**功能定位关键词:**
 
-**ProGuard / R8 混淆特征：**
+| 场景 | 关键词 | target | 包范围 prefix |
+|------|--------|--------|------------|
+| 支付 | payment, pay, purchase, order, alipay, wechatpay | dex_strings | 主包 |
+| 会员/VIP | vip, premium, member, subscribe, isVip | dex_strings + dex_names | 主包 |
+| 登录认证 | login, auth, token, session, credential, oauth | dex_strings | 主包 |
+| 网络请求 | http, retrofit, okhttp, api, baseUrl | dex_strings + dex_names | 主包 |
+| 数据存储 | sqlite, room, sharedpreferences, database, dao | dex_names | 主包 |
+| 推送 | push, fcm, jpush, xiaomi_push, notification | dex_strings | 主包 |
+| 广告 | ad, banner, interstitial, reward, admob | dex_strings | 主包 |
 
-- 短类名：`a`, `b`, `c`, `aa`, `ab`（1-2 字符，常在默认包中）
-- 短方法名：混淆类中的 `a()`, `b()`, `c()`
-- 短字段名：`a`, `b`, `c` 配合泛型类型
-- 无源文件信息：outline header 中 `source="Unknown"` 或缺失
+**安全审计关键词:**
 
-**反混淆策略：**
-
-| 策略 | 方法 | 工具调用 |
-|------|------|----------|
-| 字符串常量 | 混淆不会重命名字符串 | `search(scopes="dex_string", query="已知文本")` |
-| 类层次 | 检查 super / implements 中的已知类型 | `list(view="dex_class_outline")` → 检查 header |
-| 框架 API | 按 Android API 调用搜索 | `search(scopes="smali", query="Landroid/widget/TextView;->setText")` |
-| 入口点 | 从 manifest 组件追踪 | `read(kind="axml")` → 找到 Activities → 追踪 |
-| 资源引用 | 按 R.type.name 引用搜索 | `search(scopes="smali", query="R.string.xxx")` |
-
-多 DEX 透明处理 — 所有搜索自动覆盖所有 DEX 文件，无需特殊操作。
-
-## 5.2 架构模式识别
-
-理解 APP 的架构模式能大幅缩小搜索范围——知道代码在哪一层，就不用大海捞针。
-
-**架构特征速判：**
-
-| 架构 | 包名特征 | 关键类后缀 | 业务逻辑所在 |
-|------|---------|-----------|------------|
-| MVVM | `.ui.`, `.viewmodel.`, `.repository.` | ViewModel, Repository | ViewModel 中 |
-| MVP | `.presenter.`, `.view.`, `.contract.` | Presenter, Contract | Presenter 中 |
-| MVC | `.controller.`, `.model.` | Controller, Model | Activity/Controller 中 |
-| Clean | `.domain.`, `.data.`, `.presentation.` | UseCase, Repository (接口) | UseCase / Interactor 中 |
-| MVI | `.intent.`, `.state.`, `.reducer.` | Reducer, State, Intent | Reducer 中 |
-
-**实操建议：** 先用 `dex_classes` 的 prefix 浏览包结构，观察目录命名规律，判断架构模式后再定向搜索。比如看到 `ui/main/viewmodel/` 目录，就知道是 MVVM，VIP 逻辑大概率在 `MainViewModel` 里。
-
-## 5.3 防御机制识别
-
-很多 APP 内置了防篡改检测，分析时需要先识别这些机制，才能在报告中给出可行的修改方案。
-
-**常见防御类型及识别：**
-
-| 防御类型 | 特征关键词 | 识别方法 |
-|----------|-----------|----------|
-| 签名校验 | Signature, PackageInfo, signatures | 搜索 `getPackageInfo` + `GET_SIGNATURES` 组合 |
-| Root 检测 | su, Superuser, Magisk | 搜索 `"/su"` `"Superuser"` `"isRooted"` |
-| 模拟器检测 | emulator, goldfish, genymotion, nox | 搜索 `"goldfish"` `"nox"` `"isEmulator"` |
-| 调试检测 | isDebuggerConnected, TracerPid | 搜索 `isDebuggerConnected` `TracerPid` |
-| 完整性校验 | CRC, MD5, SHA, digest, checksum | 搜索 `CRC32` `MessageDigest` |
-| Hook 框架检测 | Xposed, Frida, substrate, riru | 搜索 `"Xposed"` `"frida-server"` |
-| 多重校验 | Timer + 校验，后台 Service 反复验证 | 搜索 `Timer` `AlarmManager` 配合校验关键词 |
-
-**绕过思路：**
-
-| 防御类型 | 绕过思路 | Smali 修改要点 |
-|----------|---------|---------------|
-| 签名校验 | 让校验方法始终返回 true | `const/4 v0, 0x1` + `return v0` |
-| Root 检测 | 让检测方法返回 false | `const/4 v0, 0x0` + `return v0` |
-| 模拟器检测 | 同 Root 检测 | 返回 false |
-| 调试检测 | 移除检测调用或让其返回 false | nop 掉或改返回值 |
-| 完整性校验 | 让校验方法返回 true 或跳过 | 修改条件跳转 |
-| Hook 检测 | 让检测返回 false | 同 Root 检测 |
-
-**注意：** 某些 APP 会把多种防御机制分散在不同类中，甚至用延时检测、多线程检测来增加绕过难度。先用 `dex_string` 全面搜索所有防御关键词，绘制出完整的防御体系图，再逐一处理。
-
-## 5.4 大型 APK 增量分析
-
-当 APK 包含上万类时，全量搜索既慢又容易淹没在第三方库代码中。
-
-**三层过滤模型：**
-
-```
-第一层：包名隔离
-  list(view="dex_classes", prefix="com/target/app", limit=1)
-  → 确认主包类数量，后续搜索优先用 classPrefix 限定在主包
-
-第二层：功能域定位
-  search(scopes="dex_string", query="关键词", classPrefix="com/target/app")
-  → 在主包范围内搜索，排除第三方库干扰
-
-第三层：精准读取
-  对命中类 outline → 定位目标方法 → 定向 read
-  → 只读需要的行，避免读取整个大类
-```
-
-**第三方库快速排除：** 大型 APP 中 60-80% 的类来自第三方库，搜索时用 `classPrefix` 限定在应用主包可自动跳过。如果不确定主包名，先读 Manifest 获取 `package` 属性。
-
-| 常见库包名前缀 | 所属框架 |
-|---------------|---------|
-| `com/google/` | Google 服务、Gson、Guava |
-| `com/squareup/` | OkHttp、Retrofit、Picasso |
-| `io/reactivex/` | RxJava |
-| `kotlin/`, `kotlinx/` | Kotlin 标准库、协程 |
-| `androidx/`, `com/android/` | AndroidX、Support 库 |
-| `okhttp3/`, `retrofit2/` | OkHttp3、Retrofit2 |
-| `com/bumptech/` | Glide |
-| `org/greenrobot/` | EventBus、GreenDAO |
-
-## 5.5 性能优化
-
-**分析优先级（最快获得结果的路径）：**
-
-| 优先级 | 操作 | 原因 |
-|--------|------|------|
-| 1st | 读取 AndroidManifest.xml | 零搜索成本，揭示整个应用结构 |
-| 2nd | 搜索 dex_string 关键词 | 定位功能代码最快的方式 |
-| 3rd | 列出命中类的 outline | 在读代码前理解结构 |
-| 4th | 读取特定方法 | 仅在确定目标后 |
-| 5th | 用 smali regex 追踪 | 最耗时 — 仅在需要时使用 |
-
-**性能规则：**
-
-| 规则 | 慢方式 | 快方式 |
+| 场景 | 关键词 | target |
 |------|--------|--------|
-| 使用前缀过滤 | 列出全部 → 本地过滤 | `list(prefix="com/target/pkg")` |
-| 使用特定 scope | 搜索所有 scope | 只需字符串时用 `scopes="dex_string"` |
-| 设置合理 limit | 总是用最大 limit | 20-50 浏览 / 100-200 分析 / 500-1000 导出 |
-| 批量并行调用 | 顺序搜索 | 同一消息中发起独立搜索 |
-| 缓存 workspaceId | 每次重新打开 APK | 打开一次，复用 workspaceId |
-| 先 outline 再 read | 读取完整类（数千行） | Outline → 定位目标 → 读取特定方法 |
-| 使用 classSmaliStartLine | 猜测行号 | `outline.methods[].locator` → 定向行范围读取 |
+| 敏感信息泄露 | password, secret, key, token, api_key | dex_strings |
+| 硬编码URL | `https?://[a-zA-Z0-9._-]+` (regex) | dex_strings |
+| 加密算法 | AES, RSA, MD5, SHA, Cipher, encrypt | dex_strings + smali |
+| 危险权限 | CAMERA, RECORD_AUDIO, READ_PHONE, ACCESS_FINE_LOCATION | files (AXML) |
+| WebView风险 | loadUrl, addJavascriptInterface, setJavaScriptEnabled | smali |
+| 组件暴露 | exported="true", intent-filter | files (AXML) |
+
+> **大型 APK 优化:** 先 `read_text(axml:AndroidManifest.xml)` 获取包名,再用 `prefix=主包名` 限定搜索范围,排除第三方库(占60-80%代码)。
 
 ---
 
-# 第六部分：输出规范
+## 进阶分析策略
 
-## 6.1 报告模板
+**锚点扩散法** — 从已知字符串定位功能代码:
+```
+search(target="dex_strings", query="已知字符串") → 锚点类
+→ outline_class(locator="dex_class:<锚点类>") → 了解结构
+→ search(target="smali", query="<锚点类Dalvik名>", queryType="regex") → 找引用者
+→ 对引用者重复上述步骤,绘制调用关系图
+```
 
-报告文件命名：`{apkName}_{分析类型}报告.md`
+**字段生命周期追踪** — 理解状态变量读写:
+```
+search(target="dex_names", query="isVip") → 找字段定义
+→ search(target="smali", query="iget.*isVip|sget.*isVip", queryType="regex") → 读取点
+→ search(target="smali", query="iput.*isVip|sput.*isVip", queryType="regex") → 写入点
+→ read_text(写入点方法) → 理解赋值逻辑
+```
 
-```markdown
-# {APK名称} - {分析类型}分析报告
+**方法调用链追踪** — 推荐用 xref_dex 而非 smali 搜索:
+```
+outline_class → 找方法签名
+→ xref_dex(locator="dex_method:...", methodResolution="dispatch") → 精确找调用者
+→ read_text(caller.sourceLocator) → 读调用上下文
+```
+`dispatch` 模式能找到接口/抽象方法的所有实现调用,比 smali regex 搜索更准。
 
-## 基本信息
-
-| 项目 | 值 |
-|------|------|
-| APK名称 | {apkFileName} |
-| 包名 | {packageName} |
-| 版本 | {versionName} ({versionCode}) |
-| 最低SDK | {minSdk} |
-| 目标SDK | {targetSdk} |
-| 文件大小 | {文件大小} |
-
-## 分析配置
-
-| 配置项 | 值 |
-|--------|-----|
-| 分析类型 | {分析类型} |
-| 搜索关键词 | {关键词列表} |
-| 搜索范围 | {scopes列表} |
-| 分析时间 | {时间戳} |
-
-## 分析结果
-
-### 1. {结果分类1}
-
-{详细内容，包含代码片段、定位器信息等}
-
-### 2. {结果分类2}
-
-{详细内容}
-
-...
-
-## 详细代码
-
-{可选：关键代码片段}
-
-## 总结
-
-{分析总结和建议}
+**资源反查代码** — 从 UI 资源反推逻辑:
+```
+search(target="resource_table_names", query="btn_purchase") → 资源ID
+→ xref_resource(locator="resource:0x7f...", scopes=["dex","axml","resource_table"]) → 找引用
+→ outline_class(引用类) → 找事件处理方法
+```
 
 ---
 
-*报告生成时间: {时间}*
-*分析工具: mt_mcp APK Analyzer*
+## 混淆与反混淆
+
+**混淆特征:** 短类名(a/b/c)、短方法名、短字段名、`source="Unknown"`。
+
+**反混淆策略(按可靠性排序):**
+1. **字符串常量** — 混淆不改字符串: `search(target="dex_strings", query="已知文本")` 定位锚点
+2. **类层次** — `outline_class` 检查 `header.super`/`implements` 中的已知框架类
+3. **框架API** — `search(target="smali", query="Landroid/widget/TextView;->setText")` 找UI代码
+4. **资源引用** — `search(target="smali", query="R.string.xxx")` 找资源使用者
+5. **入口点** — 从 Manifest 的 Activity 类名追踪
+
+多 DEX 透明处理,搜索自动覆盖所有 DEX。
+
+---
+
+## 架构模式识别
+
+先 `list(view="dex_classes", prefix=主包)` 浏览包结构,判断架构后定向搜索:
+
+| 架构 | 包名特征 | 业务逻辑所在层 |
+|------|---------|------------|
+| MVVM | `.ui.` `.viewmodel.` `.repository.` | ViewModel |
+| MVP | `.presenter.` `.view.` `.contract.` | Presenter |
+| Clean | `.domain.` `.data.` `.presentation.` | UseCase/Interactor |
+| MVI | `.intent.` `.state.` `.reducer.` | Reducer |
+
+看到 `ui/main/viewmodel/` 目录 → MVVM → VIP逻辑在 `MainViewModel`。
+
+---
+
+## 防御机制识别与绕过
+
+分析时先识别防御机制,修改方案才可行:
+
+| 防御类型 | 识别关键词 | 绕过Smali修改 |
+|---------|-----------|-------------|
+| 签名校验 | getPackageInfo, GET_SIGNATURES, signatures | 校验方法 `const/4 v0, 0x1` + `return v0` |
+| Root检测 | "/su", "Superuser", "isRooted", Magisk | 检测方法 `const/4 v0, 0x0` + `return v0` |
+| 模拟器检测 | goldfish, nox, isEmulator, genymotion | 同Root,返回false |
+| 调试检测 | isDebuggerConnected, TracerPid | 移除调用或返回false |
+| 完整性校验 | CRC32, MessageDigest, checksum | 校验方法返回true |
+| Hook检测 | Xposed, frida-server, substrate | 检测方法返回false |
+
+**绕过要点:** 用 `edit_text` 的 `replace_match` 修改条件跳转(`if-eq`→`if-ne`)或方法返回值。多种防御可能分散在不同类,需全面搜索逐一处理。
+
+---
+
+## Dalvik/Smali 速查
+
+**类型映射:** `V`void `Z`boolean `I`int `J`long `F`float `D`double `B`byte `C`char `S`short / `Lcom/pkg/Cls;`类 `[I`int[] `[Ljava/lang/String;`String[]
+
+**方法签名:** `name(ParamTypes)ReturnType` — `onCreate(Landroid/os/Bundle;)V` / `isVip()Z` / `getName(I)Ljava/lang/String;`
+
+**字段访问:**
+```
+sget-object v0, LCls;->FIELD:LType;   # 读静态字段
+sput-object v0, LCls;->FIELD:LType;   # 写静态字段
+iget-object v0, v1, LCls;->FIELD:LType;  # 读实例字段(v1=对象)
+iput-object v0, v1, LCls;->FIELD:LType;  # 写实例字段
 ```
 
-## 6.2 报告撰写心法
-
-一份好的分析报告不只是罗列搜索结果，而是让读者看完就知道"该改哪里、怎么改"。
-
-**报告质量分级：**
-
-| 等级 | 特征 | 读者体验 |
-|------|------|---------|
-| 初级 | 粘贴搜索结果原文 | "看到了，但不知道怎么办" |
-| 中级 | 按功能模块分类整理，标注关键类/方法 | "知道在哪，但不确定怎么改" |
-| 高级 | 每个发现都附带定位器、修改方案、验证方法 | "直接可以动手改" |
-
-**每个分析发现的必备要素：**
-
-1. **定位信息** — 类名（Dalvik 格式）、方法签名、关键字符串
-2. **代码上下文** — 关键 Smali 代码片段，包含条件判断和跳转逻辑
-3. **影响分析** — 这个发现意味着什么，修改后会有什么效果
-4. **修改方案** — 具体改哪一行、改成什么，给出修改前后的 Smali 对比
-5. **风险评估** — 修改是否可能影响其他功能、是否需要同时处理防御机制
-
-**代码片段呈现规范：** 用 `← [修改点]` 标注需要修改的行：
-
+**方法调用:**
 ```
-.method public isVip()Z
-    ...
-    if-eqz v0, :cond_0        ← [修改点] 改为 if-nez 跳过 VIP 检查
-    ...
-    return v0
-.end method
+invoke-virtual {v0,v1}, LCls;->method(I)V      # 实例方法
+invoke-static {v0}, LCls;->staticMethod(I)I     # 静态方法
+invoke-interface {v0}, LIfc;->method()V         # 接口方法
+invoke-direct {v0,v1}, LCls;-><init>(I)V        # 构造函数/private
 ```
 
-## 6.3 解决方案建议
+**控制流(常见修改点):**
+```
+if-eqz v0, :label    # v0==null跳转  → 改 if-nez 反转逻辑
+if-nez v0, :label    # v0!=null跳转  → 改 if-eqz 反转逻辑
+const/4 v0, 0x0      # false          → 改 0x1 为 true
+const/4 v0, 0x1      # true           → 改 0x0 为 false
+return v0            # 返回值
+return-void          # 提前返回(移除广告/跳过校验)
+```
 
-**重要原则：分析报告必须包含解决方案建议部分，指导用户如何处理分析结果。**
+**常见修改模式:**
+| 需求 | 修改方法 |
+|------|---------|
+| 跳过VIP验证 | `if-eq` → `if-ne` 或方法直接 `const/4 v0, 0x1` + `return v0` |
+| 解锁付费功能 | 状态检查返回 true |
+| 移除广告 | 广告加载方法开头加 `return-void` |
+| 绕过登录 | 登录状态检查返回 true |
+| 禁用更新 | 版本比较逻辑反转 |
 
-**工具选择原则：**
+---
 
-| 场景 | 推荐工具 | 说明 |
-|------|---------|------|
-| 常规修改 | MT管理器 | 首选，手机端直接操作 |
-| 字符串修改 | MT管理器 | 字符串常量替换 |
-| 跳过逻辑 | MT管理器 | 方法修改、条件跳转 |
-| 资源修改 | MT管理器 | XML、图片等资源 |
-| 复杂重构 | 电脑端工具 | 需要重新编译的情况 |
-| 大规模修改 | 电脑端工具 | 批量处理、自动化 |
+## 常见错误
 
-**MT管理器操作指南：**
-
-| 操作 | MT管理器方法 |
-|------|-------------|
-| 打开APK | 长按APK → 查看详情 → 打开方式 → APK查看 |
-| 查看DEX | APK查看 → classes.dex → Dex编辑器++ |
-| 搜索字符串 | Dex编辑器++ → 搜索 → 字符串搜索 |
-| 搜索类名 | Dex编辑器++ → 搜索 → 类名搜索 |
-| 搜索方法 | Dex编辑器++ → 搜索 → 方法搜索 |
-
-**常见修改模式：**
-
-| 需求 | Smali修改方法 |
-|------|--------------|
-| 跳过VIP验证 | if-eq → if-ne 或 return-void |
-| 解锁功能 | const/4 v0, 0x0 → const/4 v0, 0x1 |
-| 移除广告 | return-void 提前返回 |
-| 绕过登录 | 修改登录状态检查 |
-| 禁用更新 | 修改版本比较逻辑 |
-
-**字符串修改：** 打开 APK → Dex编辑器++ → 字符串搜索 → 转到定义 → 长按编辑 → 保存并退出 → 自动签名
-
-**方法修改：** 打开 APK → Dex编辑器++ → 搜索方法 → 查看 Smali → 修改条件跳转（if-eq→if-ne 或 goto）→ 保存并退出 → 自动签名
-
-**XML修改：** 打开 APK → 查看详情 → 找到目标 XML → 长按编辑 → 修改 → 保存 → 自动重新打包签名
-
-**资源修改：** 打开 APK → 查看详情 → res/ 目录 → 替换/编辑资源 → 返回 → 自动重新打包签名
-
-**电脑端工具推荐：**
-
-| 工具 | 用途 | 说明 |
+| 错误 | 原因 | 修复 |
 |------|------|------|
-| jadx | 反编译查看 | 查看Java源码，理解逻辑 |
-| apktool | 完整反编译 | 反编译Smali和资源 |
-| Android Studio | 调试分析 | 动态调试、内存分析 |
-| Frida | 动态Hook | 运行时修改、绕过检测 |
-| Xposed | 框架Hook | 系统级Hook |
-| np管理器 | 类似MT | 另一个手机端选择 |
+| Invalid target | target 非枚举值 | 用 `overview`/`files`/`dex_names`/`dex_strings`/`dex_string_members`/`smali`/`resource_table_*` 之一 |
+| Class not found | locator 非 Dalvik 格式 | 用 `dex_class:Lcom/example/Cls;` 而非 `com.example.Cls` |
+| Unsupported locator | locator 前缀错误 | read_text 接受 `zip_entry:`/`axml:`/`dex_class:`/`dex_method:`/`dex_field:`;read_resource 接受 `resource:` |
+| Missing required field | 缺少必填参数 | 所有参数必填,基础工作区 editSessionId 传 `""` |
+| Data truncated | 输出过大 | 增大 maxChars(max 131072) / 用 startLine+limit / 用 continue |
+| exact + smali 冲突 | target=smali 且 matchMode=exact | target="smali" 时用 matchMode="contains" |
+| TEXT_MATCH_AMBIGUOUS | edit_text matchText 多次匹配 | 提供更长上下文使 matchText 唯一 |
+| NOT_TEXT_ENTRY | read_text 读二进制条目 | 改用 mt_apk_read_zip_bytes |
+| Stale targetVersion | 编辑时版本号过期 | 重新 read_text/read_resource 获取 targetVersion |
+| OUTPUT_ALREADY_EXISTS | build 时文件已存在 | 传 overwrite=true 或换 outputName |
 
-电脑端工作流：jadx 理解逻辑 → apktool 反编译 → 修改 Smali/资源 → apktool 重打包 → 签名 → 安装测试
-
-**解决方案模板：**
-
-```markdown
-## 解决方案建议
-
-### 推荐工具
-
-本分析结果推荐使用 **MT管理器** 进行修改。
-
-### 修改步骤
-
-1. **定位目标**
-   - 类名: `com.example.xxx`
-   - 方法名: `methodName`
-   - 关键字符串: `xxx`
-
-2. **MT管理器操作**
-   - 打开APK → Dex编辑器++
-   - 搜索 [类名/方法名/字符串]
-   - 进入目标位置
-
-3. **具体修改**
-   - 找到指令: `if-eq v0, v1, :cond_x`
-   - 修改为: `if-ne v0, v1, :cond_x`
-   - 保存并退出
-
-4. **验证**
-   - 安装修改后的APK
-   - 测试功能是否正常
-
-### 注意事项
-
-- 修改后需要重新签名
-- 部分应用有签名校验，需要额外处理
-- 建议备份原APK
-
-### 备选方案
-
-如果MT管理器无法处理，推荐使用:
-- jadx + apktool（电脑端）
-- Frida（动态Hook）
-```
-
-**特殊情况处理：**
-
-| 情况 | MT管理器方案 | 电脑端方案 |
-|------|-------------|-----------|
-| 签名校验 | 搜索签名验证代码并移除 | Lucky Patcher / 核心破解 |
-| 加壳应用 | 无法处理 | 脱壳工具（BlackDex等） |
-| 混淆代码 | 需要分析映射关系 | jadx + proguard mapping |
-| Native库 | 无法直接修改 | IDA Pro / Ghidra |
-| 资源加密 | 需要解密脚本 | Python脚本处理 |
+错误码:4401=参数校验错误,400=业务逻辑错误。检查 `recoverable`/`retrySameArguments` 标志和 `nextActions` 数组。
 
 ---
 
-# 附录
+## 分页与返回结构
 
-## A. Dalvik 描述符参考
+所有调用返回 `{ok, data, error, nextActions}`。当 `pagination.hasMore=true` 时,从 `nextActions[].arguments` 复制 `workspaceId`/`editSessionId`/`nextCursor`/`limit` 调用 `mt_apk_continue`。**游标不透明,不要解析/构造/修改。**
 
-**类型映射：**
+`mt_apk_list_available_apks` 续页时:`workspaceId="available_apks"`, `editSessionId=""`。
 
-| Java | Dalvik | | Java | Dalvik |
-|------|--------|-|------|--------|
-| void | V | | boolean | Z |
-| int | I | | long | J |
-| float | F | | double | D |
-| byte | B | | char | C |
-| short | S | | Object | Ljava/lang/Object; |
-| String | Ljava/lang/String; | | int[] | [I |
-| String[] | [Ljava/lang/String; | | MyClass | Lcom/example/MyClass; |
-| MyClass[] | [Lcom/example/MyClass; | | List\<T\> | Ljava/util/List; (擦除) |
+## APK 匹配
 
-**方法签名：** `methodName(ParamTypes)ReturnType`
+`mt_apk_open` 的 path 支持模糊匹配:
+- `"mt://current-apk"` → 当前APK
+- `"com.tencent.mm"` → 包名匹配
+- `"微信"` / `"kwyy"` → 模糊匹配文件名或包名
+- `"a.apk"` → 精确匹配
 
-```
-void onCreate(Bundle)           →  onCreate(Landroid/os/Bundle;)V
-boolean isVip()                 →  isVip()Z
-String getName(int)             →  getName(I)Ljava/lang/String;
-void set(int, Object)           →  set(ILjava/lang/Object;)V
-int[] getIds()                  →  getIds()[I
-```
-
-**字段签名：** `fieldName:Type`
-
-```
-VipStatus Activated             →  Activated:Lcom/example/VipStatus;
-int count                       →  count:I
-boolean isVip                   →  isVip:Z
-String name                     →  name:Ljava/lang/String;
-```
-
-## B. Smali 速查
-
-**字段访问：**
-
-```
-sget-object v0, LCls;->FIELD:LType;      # 读取静态字段
-sput-object v0, LCls;->FIELD:LType;      # 写入静态字段
-iget-object v0, v1, LCls;->FIELD:LType;  # 读取实例字段 (v1=对象引用)
-iput-object v0, v1, LCls;->FIELD:LType;  # 写入实例字段 (v1=对象引用)
-
-原始类型变体: sget/sput/iget/iput (int), -wide (long/double), -boolean
-```
-
-**方法调用：**
-
-```
-invoke-virtual   {v0,v1}, LCls;->method(I)V       # 实例方法
-invoke-static    {v0},    LCls;->staticMethod(I)I  # 静态方法
-invoke-interface {v0},    LIfc;->method()V          # 接口方法
-invoke-direct    {v0,v1}, LCls;-><init>(I)V         # 构造函数 / private
-invoke-super     {v0,v1}, LCls;->method(I)V         # 父类调用
-
-调用后: move-result v0 (原始类型) / move-result-object v0 (对象类型)
-```
-
-**控制流与常量：**
-
-```
-if-eqz v0, :label           # if v0 == null → 跳转到 label
-if-nez v0, :label           # if v0 != null → 跳转到 label
-instance-of v0, v1, LType;  # v0 = (v1 instanceof Type)
-check-cast v0, LType;       # 将 v0 转型为 Type
-return v0                   # 返回 int/boolean 等
-return-object v0            # 返回对象引用
-return-void                 # 返回 void
-const/4 v0, 0x1             # 小整数常量 (0-7)
-const/16 v0, 0x100          # 中等整数常量
-const-string v0, "text"     # 字符串常量
-aget-object v0, v1, v2      # v0 = v1[v2] (数组读取)
-aput-object v0, v1, v2      # v1[v2] = v0 (数组写入)
-```
-
-## C. 注意事项
-
-1. **APK 选择**: 支持模糊名称匹配，无需精确输入完整文件名
-2. **多匹配处理**: 如果匹配到多个 APK，列出结果让用户选择
-3. **大型 APK**: 使用分页处理（limit + nextCursor）
-4. **性能优化**: 使用 classPrefix、zipEntryPrefix 缩小范围
-5. **敏感信息**: 在报告中适当脱敏
-6. **资源释放**: 分析完成后可关闭工作区
-7. **报告保存**: 保存在当前工作目录
-8. **MCP 服务器地址**: 以实际连接成功的 MCP 配置为准，`http://127.0.0.1:8787/mcp` 仅为示例
+若返回 `CURRENT_APK_NOT_AVAILABLE`,先调 `mt_apk_list_available_apks` 获取列表再选择。多匹配时列出结果让用户选择。

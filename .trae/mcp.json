@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "MT_MCP": {
-      "url": "http://10.69.47.56:8787/mcp"
+      "url": "http://127.0.0.1:8787/mcp"
     }
   }
 }
